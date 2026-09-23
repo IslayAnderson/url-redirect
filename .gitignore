@@ -1,0 +1,12 @@
+# Environment / editor
+.venv/
+.idea/
+__pycache__/
+
+# URL lists and generated output
+live
+staging
+*.csv
+*.conf
+.htaccess
+*.txt
