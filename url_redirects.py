@@ -13,8 +13,10 @@ Input files: one URL (or path) per line. Blank lines and lines starting with # a
 
 import argparse
 import csv
+import os
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from difflib import SequenceMatcher
 from urllib.parse import urlparse, unquote
 
@@ -60,25 +62,66 @@ def similarity(old, new):
     return 0.45 * slug_score + 0.35 * token_score + 0.20 * path_score
 
 
-def build_redirects(old_urls, new_urls, threshold):
+def ratio_bound(a, b):
+    """Upper bound on SequenceMatcher(None, a, b).ratio() from the lengths alone."""
+    total = len(a) + len(b)
+    return 2.0 * min(len(a), len(b)) / total if total else 1.0
+
+
+def best_match(old_n, candidates):
+    """Return (url, score) of the most similar candidate. candidates: [(url, path, slug, token set)]."""
+    old_slug = old_n.rsplit("/", 1)[-1]
+    old_tok = set(tokens(old_n))
+    best_url, best_score = None, 0.0
+    for new, new_n, new_slug, new_tok in candidates:
+        union = old_tok | new_tok
+        token_score = len(old_tok & new_tok) / len(union) if union else 0.0
+        # skip candidates that can't beat the best so far; the full comparison is the slow part
+        if 0.45 * ratio_bound(old_slug, new_slug) + 0.35 * token_score + 0.20 * ratio_bound(old_n, new_n) <= best_score:
+            continue
+        score = similarity(old_n, new_n)
+        if score > best_score:
+            best_url, best_score = new, score
+    return best_url, best_score
+
+
+_candidates = None
+
+
+def _init_worker(candidates):
+    global _candidates
+    _candidates = candidates
+
+
+def _best_matches(paths):
+    return [best_match(p, _candidates) for p in paths]
+
+
+def build_redirects(old_urls, new_urls, threshold, jobs=None):
     new_norm = {u: normalise_path(u) for u in new_urls}
     norm_to_new = {n: u for u, n in new_norm.items()}
+    candidates = [(u, n, n.rsplit("/", 1)[-1], set(tokens(n))) for u, n in new_norm.items()]
+
+    old_norm = [(old, normalise_path(old)) for old in old_urls]
+    # Identical path on the new site: nothing to redirect.
+    to_match = [n for _, n in old_norm if n not in norm_to_new]
+
+    jobs = jobs or os.cpu_count() or 1
+    if jobs > 1 and len(to_match) * len(candidates) > 200_000:
+        # small chunks spread the work evenly, since some URLs take much longer to match than others
+        chunks = [to_match[i:i + 20] for i in range(0, len(to_match), 20)]
+        with ProcessPoolExecutor(jobs, initializer=_init_worker, initargs=(candidates,)) as pool:
+            matches = [m for chunk in pool.map(_best_matches, chunks) for m in chunk]
+    else:
+        matches = [best_match(n, candidates) for n in to_match]
+    matched = iter(matches)
 
     results = []
-    for old in old_urls:
-        old_n = normalise_path(old)
-
-        # Identical path on the new site: nothing to redirect.
+    for old, old_n in old_norm:
         if old_n in norm_to_new:
             results.append((old, norm_to_new[old_n], 1.0, "exact"))
             continue
-
-        best_url, best_score = None, 0.0
-        for new, new_n in new_norm.items():
-            score = similarity(old_n, new_n)
-            if score > best_score:
-                best_url, best_score = new, score
-
+        best_url, best_score = next(matched)
         status = "match" if best_score >= threshold else "low_confidence"
         results.append((old, best_url, round(best_score, 3), status))
     return results
@@ -126,13 +169,14 @@ def main():
     ap.add_argument("-t", "--threshold", type=float, default=0.4, help="minimum score to accept a match (0-1, default 0.4)")
     ap.add_argument("--include-low", action="store_true", help="include best-guess matches below the threshold (CSV otherwise lists them with a blank target)")
     ap.add_argument("--fallback", help="htaccess/nginx: redirect below-threshold URLs here instead (e.g. / )")
+    ap.add_argument("-j", "--jobs", type=int, help="processes to match with (default: one per CPU core)")
     args = ap.parse_args()
 
     old_urls, new_urls = read_urls(args.old), read_urls(args.new)
     if not new_urls:
         sys.exit("No new URLs found.")
 
-    results = build_redirects(old_urls, new_urls, args.threshold)
+    results = build_redirects(old_urls, new_urls, args.threshold, args.jobs)
 
     out = open(args.output, "w", newline="", encoding="utf-8") if args.output else sys.stdout
     try:
